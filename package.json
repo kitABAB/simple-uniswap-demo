@@ -1,0 +1,32 @@
+{
+  "name": "simple-uniswap-demo",
+  "version": "1.0.0",
+  "description": "一个简化版 Uniswap V2 风格的 AMM 训练项目（恒定乘积做市 + 工厂 + LP 代币），用于 web3 学习与求职作品集",
+  "license": "MIT",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "coverage": "hardhat coverage",
+    "node": "hardhat node",
+    "deploy:swap:local": "hardhat run scripts/deploySwap.js --network localhost",
+    "deploy:swap:sepolia": "hardhat run scripts/deploySwap.js --network sepolia"
+  },
+  "keywords": [
+    "solidity",
+    "uniswap",
+    "amm",
+    "defi",
+    "erc20",
+    "hardhat",
+    "web3",
+    "openzeppelin"
+  ],
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.22.10"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.1.0",
+    "dotenv": "^16.4.5"
+  }
+}

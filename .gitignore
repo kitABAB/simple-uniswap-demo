@@ -1,0 +1,22 @@
+# 依赖
+node_modules/
+
+# Hardhat 编译产物 & 缓存
+artifacts/
+cache/
+typechain-types/
+
+# 环境变量（含私钥，绝对不能提交）
+.env
+
+# 测试覆盖率
+coverage/
+coverage.json
+
+# 日志
+*.log
+npm-debug.log*
+
+# 系统文件
+.DS_Store
+Thumbs.db
