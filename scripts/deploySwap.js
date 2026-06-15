@@ -41,12 +41,15 @@ async function main() {
 
   const pair = await ethers.getContractAt("SimpleSwap", pairAddress);
 
+  // 截止时间：当前时间 + 20 分钟
+  const deadline = Math.floor(Date.now() / 1000) + 1200;
+
   // ---- 4) 添加初始流动性 ----
   const amountA = ethers.parseEther("10000");
   const amountB = ethers.parseEther("40000"); // 初始价格 1 TKA = 4 TKB
   await (await tokenA.approve(pairAddress, amountA)).wait();
   await (await tokenB.approve(pairAddress, amountB)).wait();
-  await (await pair.addLiquidity(amountA, amountB, deployer.address)).wait();
+  await (await pair.addLiquidity(amountA, amountB, 0, 0, deployer.address, deadline)).wait();
   const lpBalance = await pair.balanceOf(deployer.address);
   console.log("✅ 已添加初始流动性，获得 LP 代币：", ethers.formatEther(lpBalance));
 
@@ -54,7 +57,7 @@ async function main() {
   const swapIn = ethers.parseEther("100");
   await (await tokenA.approve(pairAddress, swapIn)).wait();
   const before = await tokenB.balanceOf(deployer.address);
-  await (await pair.swap(tokenAAddress, swapIn, 0, deployer.address)).wait();
+  await (await pair.swap(tokenAAddress, swapIn, 0, deployer.address, deadline)).wait();
   const after = await tokenB.balanceOf(deployer.address);
   console.log(`✅ 用 100 TKA 兑换得到 ${ethers.formatEther(after - before)} TKB`);
 

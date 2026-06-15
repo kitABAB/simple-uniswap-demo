@@ -13,6 +13,10 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///         流动性提供者（LP）按份额获得本合约铸造的 LP 代币。用于 web3 学习与作品集。
 /// @dev    本合约自身即 LP 代币（继承 ERC20）。仅做教学用途，省略了价格预言机、
 ///         flash swap、工厂多池管理等生产级功能。
+///         安全设计：
+///         - 所有改变状态的入口都带 `deadline`，防止交易长期滞留 mempool 被抢跑（MEV）。
+///         - 加/移除流动性带最小数量保护，兑换带 `amountOutMin`，抵御三明治攻击。
+///         - 转账金额一律以「转账前后余额差」为准，兼容收税型（fee-on-transfer）代币。
 contract SimpleSwap is ERC20, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -61,12 +65,20 @@ contract SimpleSwap is ERC20, ReentrancyGuard {
 
     error IdenticalTokens();
     error ZeroAddress();
+    error Expired();
     error InsufficientLiquidityMinted();
     error InsufficientLiquidityBurned();
     error InsufficientInputAmount();
     error InsufficientOutputAmount();
     error InsufficientLiquidity();
+    error SlippageExceeded();
     error InvalidToken();
+
+    /// @dev 截止时间保护：超过 deadline 的交易直接回退
+    modifier ensure(uint256 deadline) {
+        if (block.timestamp > deadline) revert Expired();
+        _;
+    }
 
     /// @param _token0 池中第一种代币地址
     /// @param _token1 池中第二种代币地址
@@ -111,15 +123,22 @@ contract SimpleSwap is ERC20, ReentrancyGuard {
     /// @notice 添加流动性并铸造 LP 代币
     /// @dev    调用前需对本合约 approve 两种代币。首次添加时几何平均决定 LP 数量，
     ///         之后按当前储备比例取较小值，避免改变池内价格。
+    ///         实际入账数量以转账前后的余额差为准，兼容收税型代币。
     /// @param amount0Desired 希望投入的 token0 数量
     /// @param amount1Desired 希望投入的 token1 数量
+    /// @param amount0Min     可接受的最小实际投入 token0（滑点保护）
+    /// @param amount1Min     可接受的最小实际投入 token1（滑点保护）
     /// @param to             LP 代币接收地址
+    /// @param deadline       交易截止时间戳
     /// @return liquidity     铸造的 LP 代币数量
     function addLiquidity(
         uint256 amount0Desired,
         uint256 amount1Desired,
-        address to
-    ) external nonReentrant returns (uint256 liquidity) {
+        uint256 amount0Min,
+        uint256 amount1Min,
+        address to,
+        uint256 deadline
+    ) external nonReentrant ensure(deadline) returns (uint256 liquidity) {
         if (to == address(0)) revert ZeroAddress();
 
         uint256 _totalSupply = totalSupply();
@@ -144,18 +163,21 @@ contract SimpleSwap is ERC20, ReentrancyGuard {
         }
 
         if (amount0 == 0 || amount1 == 0) revert InsufficientInputAmount();
+        // 滑点保护：按当前价格折算后的实际投入不得低于用户底线
+        if (amount0 < amount0Min || amount1 < amount1Min) revert SlippageExceeded();
 
-        token0.safeTransferFrom(msg.sender, address(this), amount0);
-        token1.safeTransferFrom(msg.sender, address(this), amount1);
+        // 以余额差作为真实入账量，兼容收税型代币
+        uint256 actual0 = _receive(token0, amount0);
+        uint256 actual1 = _receive(token1, amount1);
 
         if (_totalSupply == 0) {
-            // 锁定最小流动性到零地址
-            liquidity = Math.sqrt(amount0 * amount1) - MINIMUM_LIQUIDITY;
+            // 锁定最小流动性到死亡地址
+            liquidity = Math.sqrt(actual0 * actual1) - MINIMUM_LIQUIDITY;
             _mint(address(0xdead), MINIMUM_LIQUIDITY);
         } else {
             liquidity = Math.min(
-                (amount0 * _totalSupply) / reserve0,
-                (amount1 * _totalSupply) / reserve1
+                (actual0 * _totalSupply) / reserve0,
+                (actual1 * _totalSupply) / reserve1
             );
         }
 
@@ -163,7 +185,7 @@ contract SimpleSwap is ERC20, ReentrancyGuard {
         _mint(to, liquidity);
 
         _update();
-        emit LiquidityAdded(msg.sender, amount0, amount1, liquidity);
+        emit LiquidityAdded(msg.sender, actual0, actual1, liquidity);
     }
 
     // ---------------------------------------------------------------------
@@ -171,14 +193,20 @@ contract SimpleSwap is ERC20, ReentrancyGuard {
     // ---------------------------------------------------------------------
 
     /// @notice 销毁 LP 代币并按份额取回两种代币
-    /// @param liquidity 要销毁的 LP 代币数量
-    /// @param to        代币接收地址
-    /// @return amount0  取回的 token0 数量
-    /// @return amount1  取回的 token1 数量
+    /// @param liquidity  要销毁的 LP 代币数量
+    /// @param amount0Min 可接受的最小取回 token0（滑点保护）
+    /// @param amount1Min 可接受的最小取回 token1（滑点保护）
+    /// @param to         代币接收地址
+    /// @param deadline   交易截止时间戳
+    /// @return amount0   取回的 token0 数量
+    /// @return amount1   取回的 token1 数量
     function removeLiquidity(
         uint256 liquidity,
-        address to
-    ) external nonReentrant returns (uint256 amount0, uint256 amount1) {
+        uint256 amount0Min,
+        uint256 amount1Min,
+        address to,
+        uint256 deadline
+    ) external nonReentrant ensure(deadline) returns (uint256 amount0, uint256 amount1) {
         if (to == address(0)) revert ZeroAddress();
         if (liquidity == 0) revert InsufficientLiquidityBurned();
 
@@ -190,6 +218,8 @@ contract SimpleSwap is ERC20, ReentrancyGuard {
         amount0 = (liquidity * balance0) / _totalSupply;
         amount1 = (liquidity * balance1) / _totalSupply;
         if (amount0 == 0 || amount1 == 0) revert InsufficientLiquidityBurned();
+        // 滑点保护
+        if (amount0 < amount0Min || amount1 < amount1Min) revert SlippageExceeded();
 
         _burn(msg.sender, liquidity);
 
@@ -205,17 +235,20 @@ contract SimpleSwap is ERC20, ReentrancyGuard {
     // ---------------------------------------------------------------------
 
     /// @notice 用一种代币兑换另一种代币
+    /// @dev    输出按「实际入账数量」计算，因此兼容收税型输入代币。
     /// @param tokenIn      输入代币地址（必须是 token0 或 token1）
     /// @param amountIn     输入数量
     /// @param amountOutMin 可接受的最小输出数量（滑点保护）
     /// @param to           输出代币接收地址
+    /// @param deadline     交易截止时间戳
     /// @return amountOut   实际输出数量
     function swap(
         address tokenIn,
         uint256 amountIn,
         uint256 amountOutMin,
-        address to
-    ) external nonReentrant returns (uint256 amountOut) {
+        address to,
+        uint256 deadline
+    ) external nonReentrant ensure(deadline) returns (uint256 amountOut) {
         if (amountIn == 0) revert InsufficientInputAmount();
         if (to == address(0)) revert ZeroAddress();
         if (tokenIn != address(token0) && tokenIn != address(token1)) revert InvalidToken();
@@ -225,27 +258,38 @@ contract SimpleSwap is ERC20, ReentrancyGuard {
             ? (reserve0, reserve1)
             : (reserve1, reserve0);
 
-        amountOut = getAmountOut(amountIn, reserveIn, reserveOut);
-        if (amountOut < amountOutMin) revert InsufficientOutputAmount();
-
         IERC20 inToken = isToken0In ? token0 : token1;
         IERC20 outToken = isToken0In ? token1 : token0;
 
-        inToken.safeTransferFrom(msg.sender, address(this), amountIn);
+        // 先收款，并以余额差作为真实入账量（兼容收税型代币）
+        uint256 actualIn = _receive(inToken, amountIn);
+
+        amountOut = getAmountOut(actualIn, reserveIn, reserveOut);
+        if (amountOut < amountOutMin) revert InsufficientOutputAmount();
+
         outToken.safeTransfer(to, amountOut);
 
         _update();
 
         if (isToken0In) {
-            emit Swap(msg.sender, to, amountIn, 0, 0, amountOut);
+            emit Swap(msg.sender, to, actualIn, 0, 0, amountOut);
         } else {
-            emit Swap(msg.sender, to, 0, amountIn, amountOut, 0);
+            emit Swap(msg.sender, to, 0, actualIn, amountOut, 0);
         }
     }
 
     // ---------------------------------------------------------------------
     // 内部工具
     // ---------------------------------------------------------------------
+
+    /// @dev 从调用者收取 `amount` 个 `token`，返回合约真实入账数量（余额差）。
+    ///      对收税型代币而言，返回值会小于 `amount`。
+    function _receive(IERC20 token, uint256 amount) private returns (uint256 received) {
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        received = token.balanceOf(address(this)) - balanceBefore;
+        if (received == 0) revert InsufficientInputAmount();
+    }
 
     /// @dev 用合约真实余额刷新储备缓存
     function _update() private {

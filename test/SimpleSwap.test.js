@@ -4,6 +4,7 @@ const { loadFixture } = require("@nomicfoundation/hardhat-toolbox/network-helper
 
 const MINIMUM_LIQUIDITY = 1000n;
 const DEAD = "0x000000000000000000000000000000000000dEaD";
+const DEADLINE = 99999999999n; // 远未来时间戳
 
 // 与合约一致的报价公式（0.3% 手续费）
 function getAmountOut(amountIn, reserveIn, reserveOut) {
@@ -47,7 +48,6 @@ describe("SimpleSwap", function () {
     const pair = await Swap.deploy(await tokenA.getAddress(), await tokenB.getAddress());
     await pair.waitForDeployment();
 
-    // 给 alice、bob 分发一些代币
     for (const user of [alice, bob]) {
       await tokenA.mint(user.address, ethers.parseEther("100000"));
       await tokenB.mint(user.address, ethers.parseEther("100000"));
@@ -59,7 +59,9 @@ describe("SimpleSwap", function () {
   async function addLiquidity(pair, tokenA, tokenB, signer, amountA, amountB) {
     await tokenA.connect(signer).approve(await pair.getAddress(), amountA);
     await tokenB.connect(signer).approve(await pair.getAddress(), amountB);
-    return pair.connect(signer).addLiquidity(amountA, amountB, signer.address);
+    return pair
+      .connect(signer)
+      .addLiquidity(amountA, amountB, 0, 0, signer.address, DEADLINE);
   }
 
   describe("部署", function () {
@@ -115,17 +117,15 @@ describe("SimpleSwap", function () {
       await addLiquidity(pair, tokenA, tokenB, alice, ethers.parseEther("1000"), ethers.parseEther("4000"));
 
       const totalBefore = await pair.totalSupply();
-      // bob 提供 500/4000，比例上限受 token0 约束 -> 实际只用 500/2000
       const amountA = ethers.parseEther("500");
       const amountB = ethers.parseEther("4000");
       await tokenA.connect(bob).approve(await pair.getAddress(), amountA);
       await tokenB.connect(bob).approve(await pair.getAddress(), amountB);
 
       const tokenBBefore = await tokenB.balanceOf(bob.address);
-      await pair.connect(bob).addLiquidity(amountA, amountB, bob.address);
+      await pair.connect(bob).addLiquidity(amountA, amountB, 0, 0, bob.address, DEADLINE);
       const tokenBAfter = await tokenB.balanceOf(bob.address);
 
-      // 只消耗了 2000 TKB（保持 1:4 比例）
       expect(tokenBBefore - tokenBAfter).to.equal(ethers.parseEther("2000"));
 
       const expectedLp = (amountA * totalBefore) / ethers.parseEther("1000");
@@ -137,6 +137,32 @@ describe("SimpleSwap", function () {
       await expect(
         addLiquidity(pair, tokenA, tokenB, alice, 0n, ethers.parseEther("1"))
       ).to.be.revertedWithCustomError(pair, "InsufficientInputAmount");
+    });
+
+    it("实际投入低于最小值应回退（滑点保护）", async function () {
+      const { pair, tokenA, tokenB, alice, bob } = await loadFixture(deployFixture);
+      await addLiquidity(pair, tokenA, tokenB, alice, ethers.parseEther("1000"), ethers.parseEther("4000"));
+
+      // bob 期望投入 500 TKA / 4000 TKB，但按 1:4 比例实际只会用到 2000 TKB，
+      // 把 amount1Min 设为 4000 则触发滑点保护
+      const amountA = ethers.parseEther("500");
+      const amountB = ethers.parseEther("4000");
+      await tokenA.connect(bob).approve(await pair.getAddress(), amountA);
+      await tokenB.connect(bob).approve(await pair.getAddress(), amountB);
+      await expect(
+        pair.connect(bob).addLiquidity(amountA, amountB, 0, amountB, bob.address, DEADLINE)
+      ).to.be.revertedWithCustomError(pair, "SlippageExceeded");
+    });
+
+    it("超过 deadline 应回退", async function () {
+      const { pair, tokenA, tokenB, alice } = await loadFixture(deployFixture);
+      await tokenA.connect(alice).approve(await pair.getAddress(), ethers.parseEther("1000"));
+      await tokenB.connect(alice).approve(await pair.getAddress(), ethers.parseEther("4000"));
+      await expect(
+        pair
+          .connect(alice)
+          .addLiquidity(ethers.parseEther("1000"), ethers.parseEther("4000"), 0, 0, alice.address, 1)
+      ).to.be.revertedWithCustomError(pair, "Expired");
     });
   });
 
@@ -152,12 +178,11 @@ describe("SimpleSwap", function () {
 
       await tokenA.connect(bob).approve(await pair.getAddress(), amountIn);
       const before = await tokenB.balanceOf(bob.address);
-      await pair.connect(bob).swap(await tokenA.getAddress(), amountIn, 0, bob.address);
+      await pair.connect(bob).swap(await tokenA.getAddress(), amountIn, 0, bob.address, DEADLINE);
       const after = await tokenB.balanceOf(bob.address);
 
       expect(after - before).to.equal(expectedOut);
 
-      // 兑换后 k 不减小（手续费留在池内）
       const [r0, r1] = await pair.getReserves();
       expect(r0 * r1).to.be.gte(rA * rB);
     });
@@ -169,8 +194,20 @@ describe("SimpleSwap", function () {
       const amountIn = ethers.parseEther("100");
       await tokenA.connect(bob).approve(await pair.getAddress(), amountIn);
       await expect(
-        pair.connect(bob).swap(await tokenA.getAddress(), amountIn, ethers.parseEther("999999"), bob.address)
+        pair
+          .connect(bob)
+          .swap(await tokenA.getAddress(), amountIn, ethers.parseEther("999999"), bob.address, DEADLINE)
       ).to.be.revertedWithCustomError(pair, "InsufficientOutputAmount");
+    });
+
+    it("超过 deadline 应回退", async function () {
+      const { pair, tokenA, tokenB, alice, bob } = await loadFixture(deployFixture);
+      await addLiquidity(pair, tokenA, tokenB, alice, ethers.parseEther("10000"), ethers.parseEther("40000"));
+      const amountIn = ethers.parseEther("100");
+      await tokenA.connect(bob).approve(await pair.getAddress(), amountIn);
+      await expect(
+        pair.connect(bob).swap(await tokenA.getAddress(), amountIn, 0, bob.address, 1)
+      ).to.be.revertedWithCustomError(pair, "Expired");
     });
 
     it("非池内代币应回退", async function () {
@@ -181,7 +218,7 @@ describe("SimpleSwap", function () {
       const other = await Mock.deploy("Other", "OTH", 18, SUPPLY);
       await other.waitForDeployment();
       await expect(
-        pair.connect(bob).swap(await other.getAddress(), ethers.parseEther("1"), 0, bob.address)
+        pair.connect(bob).swap(await other.getAddress(), ethers.parseEther("1"), 0, bob.address, DEADLINE)
       ).to.be.revertedWithCustomError(pair, "InvalidToken");
     });
   });
@@ -197,24 +234,90 @@ describe("SimpleSwap", function () {
       const aBefore = await tokenA.balanceOf(alice.address);
       const bBefore = await tokenB.balanceOf(alice.address);
 
-      await pair.connect(alice).removeLiquidity(lp, alice.address);
+      await pair.connect(alice).removeLiquidity(lp, 0, 0, alice.address, DEADLINE);
 
       const aAfter = await tokenA.balanceOf(alice.address);
       const bAfter = await tokenB.balanceOf(alice.address);
 
-      // 因 MINIMUM_LIQUIDITY 永久锁定，取回略少于全部投入
       expect(aAfter - aBefore).to.be.gt(0);
       expect(bAfter - bBefore).to.be.gt(0);
       expect(aAfter - aBefore).to.be.lt(amountA);
       expect(await pair.balanceOf(alice.address)).to.equal(0);
     });
 
+    it("取回低于最小值应回退（滑点保护）", async function () {
+      const { pair, tokenA, tokenB, alice } = await loadFixture(deployFixture);
+      await addLiquidity(pair, tokenA, tokenB, alice, ethers.parseEther("1000"), ethers.parseEther("4000"));
+      const lp = await pair.balanceOf(alice.address);
+      await expect(
+        pair.connect(alice).removeLiquidity(lp, ethers.parseEther("999999"), 0, alice.address, DEADLINE)
+      ).to.be.revertedWithCustomError(pair, "SlippageExceeded");
+    });
+
     it("销毁 0 应回退", async function () {
       const { pair, tokenA, tokenB, alice } = await loadFixture(deployFixture);
       await addLiquidity(pair, tokenA, tokenB, alice, ethers.parseEther("1000"), ethers.parseEther("4000"));
       await expect(
-        pair.connect(alice).removeLiquidity(0n, alice.address)
+        pair.connect(alice).removeLiquidity(0n, 0, 0, alice.address, DEADLINE)
       ).to.be.revertedWithCustomError(pair, "InsufficientLiquidityBurned");
+    });
+  });
+
+  describe("收税型代币（fee-on-transfer）兼容", function () {
+    async function feeFixture() {
+      const [owner, alice, bob] = await ethers.getSigners();
+      const Fee = await ethers.getContractFactory("MockFeeOnTransferERC20");
+      const Mock = await ethers.getContractFactory("MockERC20");
+      const feeTok = await Fee.deploy("Fee Token", "FEE", SUPPLY, 100n); // 1% 转账税
+      const normal = await Mock.deploy("Normal", "NRM", 18, SUPPLY);
+      await feeTok.waitForDeployment();
+      await normal.waitForDeployment();
+
+      const Swap = await ethers.getContractFactory("SimpleSwap");
+      const pair = await Swap.deploy(await feeTok.getAddress(), await normal.getAddress());
+      await pair.waitForDeployment();
+
+      await feeTok.mint(bob.address, ethers.parseEther("10000"));
+      await normal.mint(bob.address, ethers.parseEther("10000"));
+
+      return { pair, feeTok, normal, owner, alice, bob };
+    }
+
+    it("以余额差计量：加流动性储备与真实到账一致", async function () {
+      const { pair, feeTok, normal, owner } = await feeFixture();
+      const amountFee = ethers.parseEther("1000");
+      const amountNorm = ethers.parseEther("1000");
+      await feeTok.approve(await pair.getAddress(), amountFee);
+      await normal.approve(await pair.getAddress(), amountNorm);
+      await pair.addLiquidity(amountFee, amountNorm, 0, 0, owner.address, DEADLINE);
+
+      // 储备应等于合约真实余额（收税后 feeTok 到账 990）
+      const [r0, r1] = await pair.getReserves();
+      expect(r0).to.equal(await feeTok.balanceOf(await pair.getAddress()));
+      expect(r1).to.equal(await normal.balanceOf(await pair.getAddress()));
+      expect(r0).to.equal(ethers.parseEther("990")); // 1000 - 1%
+    });
+
+    it("用收税型代币兑换：按实际到账量计价，k 不被破坏", async function () {
+      const { pair, feeTok, normal, owner, bob } = await feeFixture();
+      await feeTok.approve(await pair.getAddress(), ethers.parseEther("1000"));
+      await normal.approve(await pair.getAddress(), ethers.parseEther("1000"));
+      await pair.addLiquidity(ethers.parseEther("1000"), ethers.parseEther("1000"), 0, 0, owner.address, DEADLINE);
+
+      const [r0Before, r1Before] = await pair.getReserves();
+      const kBefore = r0Before * r1Before;
+
+      const amountIn = ethers.parseEther("100");
+      await feeTok.connect(bob).approve(await pair.getAddress(), amountIn);
+      const normBefore = await normal.balanceOf(bob.address);
+      // feeTok 是 token0：实际到账 = 99，应据此计价且不回退
+      await pair.connect(bob).swap(await feeTok.getAddress(), amountIn, 0, bob.address, DEADLINE);
+      const normAfter = await normal.balanceOf(bob.address);
+
+      expect(normAfter - normBefore).to.be.gt(0);
+
+      const [r0After, r1After] = await pair.getReserves();
+      expect(r0After * r1After).to.be.gte(kBefore);
     });
   });
 

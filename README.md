@@ -18,6 +18,9 @@
 | 代币兑换 | 0.3% 手续费，带 `amountOutMin` 滑点保护 |
 | 最小流动性锁定 | 首个 LP 锁定 `MINIMUM_LIQUIDITY`，防止价格操纵 |
 | 工厂模式 | `SimpleSwapFactory` 为任意代币对创建并登记唯一池子 |
+| **截止时间保护** | 所有写入函数带 `deadline`，防止交易滞留 mempool 被抢跑（MEV） |
+| **滑点保护** | 加/移除流动性带最小数量参数，抵御三明治攻击 |
+| **收税代币兼容** | 转账金额以「余额差」计量，兼容 fee-on-transfer 代币 |
 | 安全 | `SafeERC20` + `ReentrancyGuard` 防重入 |
 | Gas 优化 | 使用自定义 `error` 代替 `require` 字符串 |
 
@@ -87,9 +90,9 @@ npm run deploy:swap:local
 
 | 方法 | 说明 |
 | --- | --- |
-| `addLiquidity(amount0Desired, amount1Desired, to)` | 注入两种代币，铸造 LP 代币 |
-| `removeLiquidity(liquidity, to)` | 销毁 LP 代币，按份额取回两种代币 |
-| `swap(tokenIn, amountIn, amountOutMin, to)` | 兑换（0.3% 手续费 + 滑点保护） |
+| `addLiquidity(amount0Desired, amount1Desired, amount0Min, amount1Min, to, deadline)` | 注入两种代币，铸造 LP 代币（带滑点 + 截止时间保护） |
+| `removeLiquidity(liquidity, amount0Min, amount1Min, to, deadline)` | 销毁 LP 代币，按份额取回两种代币（带滑点 + 截止时间保护） |
+| `swap(tokenIn, amountIn, amountOutMin, to, deadline)` | 兑换（0.3% 手续费 + 滑点 + 截止时间保护） |
 | `getAmountOut(amountIn, reserveIn, reserveOut)` | 恒定乘积报价（纯函数） |
 | `getReserves()` | 查询两种代币当前储备 |
 
